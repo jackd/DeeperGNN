@@ -58,7 +58,7 @@ def gcn_norm(edge_index, edge_weight=None, num_nodes=None, improved=False,
              add_self_loops=True, dtype=None):
 
     fill_value = 2. if improved else 1.
-    num_nodes = int(index.max()) + 1 if num_nodes is None else num_nodes
+    num_nodes = int(edge_index.max()) + 1 if num_nodes is None else num_nodes
     if edge_weight is None:
         edge_weight = torch.ones((edge_index.size(1), ), dtype=dtype,
                                  device=edge_index.device)
@@ -76,46 +76,50 @@ def gcn_norm(edge_index, edge_weight=None, num_nodes=None, improved=False,
     return edge_index, deg_inv_sqrt[row] * edge_weight * deg_inv_sqrt[col]
 
 class Prop(MessagePassing):
-    def __init__(self, num_classes, K, bias=True, **kwargs):
+    def __init__(self, num_classes, K, bias=True, *, static: bool = False, **kwargs):
         super(Prop, self).__init__(aggr='add', **kwargs)
         self.K = K
-        self.proj = Linear(num_classes, 1)
-        
+        self.static = static
+        if not self.static:
+            self.proj = Linear(num_classes, 1)
+
     def forward(self, x, edge_index, norm):
-
-
         preds = []
         preds.append(x)
         for k in range(self.K):
             x = self.propagate(edge_index, x=x, norm=norm)
             preds.append(x)
-            
+
         pps = torch.stack(preds, dim=1)
-        retain_score = self.proj(pps)
-        retain_score = retain_score.squeeze()
-        retain_score = torch.sigmoid(retain_score)
-        retain_score = retain_score.unsqueeze(1)
-        out = torch.matmul(retain_score, pps).squeeze()
+        if self.static:
+            out = pps.sum(1)
+        else:
+            retain_score = self.proj(pps)
+            retain_score = retain_score.squeeze()
+            retain_score = torch.sigmoid(retain_score)
+            retain_score = retain_score.unsqueeze(1)
+            out = torch.matmul(retain_score, pps).squeeze()
 
         return out
-    
+
     def message(self, x_j, norm):
         return norm.view(-1, 1) * x_j
 
     def __repr__(self):
         return '{}(K={})'.format(self.__class__.__name__, self.K)
-    
+
     def reset_parameters(self):
-        self.proj.reset_parameters()
-        
-        
+        if not self.static:
+            self.proj.reset_parameters()
+
+
 class Net(torch.nn.Module):
-    def __init__(self, num_features, num_classes, hidden, K, dropout):
+    def __init__(self, num_features, num_classes, hidden, K, dropout, *, static: bool = False):
         super(Net, self).__init__()
         self.lin1 = Linear(num_features, hidden)
         self.lin2 = Linear(hidden, num_classes)
         self.bn = torch.nn.BatchNorm1d(hidden)
-        self.prop = Prop(num_classes, K)
+        self.prop = Prop(num_classes, K, static=static)
         self.dropout = dropout
 
     def reset_parameters(self):
@@ -143,9 +147,13 @@ parser.add_argument('--dropout', type=float, default=0.2)
 parser.add_argument('--K', type=int, default=16)
 parser.add_argument('--weight_decay', type=float, default=0)
 parser.add_argument('--log_steps', type=int, default=1)
+parser.add_argument("--static", default=False, action="store_true")
+parser.add_argument("--seed", type=int, default=0)
 
 
 args = parser.parse_args()
+torch.random.manual_seed(args.seed)
+
 
 
 def tab_printer(args):
@@ -179,7 +187,7 @@ train_idx = split_idx['train'].to(device)
 evaluator = Evaluator(name='ogbn-arxiv')
 logger = Logger(args.runs, None)
 
-model = Net(num_features, num_classes, args.hidden, args.K, args.dropout).to(device)
+model = Net(num_features, num_classes, args.hidden, args.K, args.dropout, static=args.static).to(device)
 
 print('#Parameters:', sum(p.numel() for p in model.parameters()))
 

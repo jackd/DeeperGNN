@@ -23,8 +23,12 @@ parser.add_argument('--hidden', type=int, default=64)
 parser.add_argument('--dropout', type=float, default=0.5)
 parser.add_argument('--normalize_features', type=bool, default=True)
 parser.add_argument('--K', type=int, default=10)
+parser.add_argument('--static', default=False, action='store_true')
+parser.add_argument('--plot', default=False, action='store_true')
+parser.add_argument('--seed', type=int, default=0)
 
 args = parser.parse_args()
+torch.random.manual_seed(args.seed)
 
 def gcn_norm(edge_index, edge_weight=None, num_nodes=None, improved=False,
              add_self_loops=True, dtype=None):
@@ -48,11 +52,14 @@ def gcn_norm(edge_index, edge_weight=None, num_nodes=None, improved=False,
     return edge_index, deg_inv_sqrt[row] * edge_weight * deg_inv_sqrt[col]
 
 class Prop(MessagePassing):
-    def __init__(self, num_classes, K, bias=True, **kwargs):
+    def __init__(self, num_classes, K, bias=True, static=False, **kwargs):
         super(Prop, self).__init__(aggr='add', **kwargs)
         self.K = K
-        self.proj = Linear(num_classes, 1)
-        
+        self.retain_score = None
+        self.static = static
+        if not static:
+            self.proj = Linear(num_classes, 1)
+
     def forward(self, x, edge_index, edge_weight=None):
         # edge_index, norm = GCNConv.norm(edge_index, x.size(0), edge_weight, dtype=x.dtype)
         edge_index, norm = gcn_norm(edge_index, edge_weight, x.size(0), dtype=x.dtype)
@@ -65,11 +72,15 @@ class Prop(MessagePassing):
             preds.append(x)
            
         pps = torch.stack(preds, dim=1)
-        retain_score = self.proj(pps)
-        retain_score = retain_score.squeeze()
-        retain_score = torch.sigmoid(retain_score)
-        retain_score = retain_score.unsqueeze(1)
-        out = torch.matmul(retain_score, pps).squeeze()
+        if self.static:
+            out = pps.sum(1)
+        else:
+            retain_score = self.proj(pps)
+            retain_score = retain_score.squeeze()
+            retain_score = torch.sigmoid(retain_score)
+            self.retain_score = retain_score
+            retain_score = retain_score.unsqueeze(1)
+            out = torch.matmul(retain_score, pps).squeeze()
         return out
     
     def message(self, x_j, norm):
@@ -79,15 +90,16 @@ class Prop(MessagePassing):
         return '{}(K={})'.format(self.__class__.__name__, self.K)
     
     def reset_parameters(self):
-        self.proj.reset_parameters()
-    
-    
+        if not self.static:
+            self.proj.reset_parameters()
+
+
 class Net(torch.nn.Module):
     def __init__(self, dataset):
         super(Net, self).__init__()
         self.lin1 = Linear(dataset.num_features, args.hidden)
         self.lin2 = Linear(args.hidden, dataset.num_classes)
-        self.prop = Prop(dataset.num_classes, args.K)
+        self.prop = Prop(dataset.num_classes, args.K, static=args.static)
 
     def reset_parameters(self):
         self.lin1.reset_parameters()
@@ -104,25 +116,55 @@ class Net(torch.nn.Module):
         return F.log_softmax(x, dim=1)
 
 warnings.filterwarnings("ignore", category=UserWarning)
-    
+
+if args.plot and args.static:
+    raise RuntimeError("Cannot plot adaptive weight factors for static model")
+
 if args.dataset == "Cora" or args.dataset == "CiteSeer" or args.dataset == "PubMed":
     dataset = get_planetoid_dataset(args.dataset, args.normalize_features)
     permute_masks = random_planetoid_splits if args.random_splits else None
     print("Data:", dataset[0])
-    run(dataset, Net(dataset), args.runs, args.epochs, args.lr, args.weight_decay, args.early_stopping, permute_masks, lcc=False)
+    run(
+        dataset,
+        Net(dataset),
+        args.runs,
+        args.epochs,
+        args.lr,
+        args.weight_decay,
+        args.early_stopping,
+        permute_masks,
+        lcc=False,
+        plot_retain=args.plot,
+    )
 elif args.dataset == "cs" or args.dataset == "physics":
     dataset = get_coauthor_dataset(args.dataset, args.normalize_features)
     permute_masks = random_coauthor_amazon_splits
     print("Data:", dataset[0])
-    run(dataset, Net(dataset), args.runs, args.epochs, args.lr, args.weight_decay, args.early_stopping, permute_masks, lcc=False)
+    run(
+        dataset,
+        Net(dataset),
+        args.runs,
+        args.epochs,
+        args.lr,
+        args.weight_decay,
+        args.early_stopping,
+        permute_masks,
+        lcc=False,
+        plot_retain=args.plot,
+    )
 elif args.dataset == "computers" or args.dataset == "photo":
     dataset = get_amazon_dataset(args.dataset, args.normalize_features)
     permute_masks = random_coauthor_amazon_splits
     print("Data:", dataset[0])
-    run(dataset, Net(dataset), args.runs, args.epochs, args.lr, args.weight_decay, args.early_stopping, permute_masks, lcc=True)
-
-
-
-
-
-
+    run(
+        dataset,
+        Net(dataset),
+        args.runs,
+        args.epochs,
+        args.lr,
+        args.weight_decay,
+        args.early_stopping,
+        permute_masks,
+        lcc=True,
+        plot_retain=args.plot,
+    )

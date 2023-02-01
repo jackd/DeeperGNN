@@ -80,9 +80,19 @@ def random_coauthor_amazon_splits(data, num_classes, lcc_mask):
     return data
 
 
-def run(dataset, model, runs, epochs, lr, weight_decay, early_stopping,
-        permute_masks=None, logger=None, lcc=False, save_path=None):
-
+def run(
+    dataset,
+    model,
+    runs,
+    epochs,
+    lr,
+    weight_decay,
+    early_stopping,
+    permute_masks=None,
+    logger=None,
+    lcc=False,
+    plot_retain=False,
+):
     val_losses, accs, durations = [], [], []
     lcc_mask = None
     if lcc:  # select largest connected component
@@ -94,10 +104,8 @@ def run(dataset, model, runs, epochs, lr, weight_decay, early_stopping,
         print("#Nodes after lcc:", data_nx.number_of_nodes())
         lcc_mask = list(data_nx.nodes)
 
-  
     data = dataset[0]
     pbar = tqdm(range(runs), unit='run')
-        
     for _ in pbar:
         if permute_masks is not None:
             data = permute_masks(data, dataset.num_classes, lcc_mask)
@@ -114,7 +122,7 @@ def run(dataset, model, runs, epochs, lr, weight_decay, early_stopping,
         best_val_loss = float('inf')
         test_acc = 0
         val_loss_history = []
-        
+        best_retain_score = None
 
         for epoch in range(1, epochs + 1):
             out = train(model, optimizer, data)
@@ -127,6 +135,10 @@ def run(dataset, model, runs, epochs, lr, weight_decay, early_stopping,
             if eval_info['val_loss'] < best_val_loss:
                 best_val_loss = eval_info['val_loss']
                 test_acc = eval_info['test_acc']
+
+                best_retain_score = model.prop.retain_score
+                if best_retain_score is not None:
+                    best_retain_score = best_retain_score.detach().cpu().numpy()
 
             val_loss_history.append(eval_info['val_loss'])
             if early_stopping > 0 and epoch > epochs // 2:
@@ -142,10 +154,29 @@ def run(dataset, model, runs, epochs, lr, weight_decay, early_stopping,
         val_losses.append(best_val_loss)
         accs.append(test_acc)
         durations.append(t_end - t_start)
+        if plot_retain and best_retain_score is not None:
+            import matplotlib.pyplot as plt
+            def set_axis_style(ax, labels):
+                ax.xaxis.set_tick_params(direction='out')
+                ax.xaxis.set_ticks_position('bottom')
+                ax.set_xticks(np.arange(1, len(labels) + 1), labels=labels)
+                ax.set_xlim(0.25, len(labels) + 0.75)
+            score = best_retain_score
+            score = score / np.mean(score, axis=1, keepdims=True)
+            plt.violinplot(score.T, showextrema=True)
+
+            plt.ylabel(r"$\mathbf{w}^{(k)} / \bar{\mathbf{w}}$")
+            plt.xlabel("$k$")
+            set_axis_style(plt.gca(), [str(i) for i in range(score.shape[1])])
+            # buffer = 1.025 * max(1 - score.min(), score.max() - 1)
+            # plt.ylim(1 - buffer, 1 + buffer)
+            plt.ylim(0.93, 1.07)
+            plt.title(f"Adaptive Weight Factor, {dataset.name}")
+            plt.show()
 
     loss, acc, duration = tensor(val_losses), tensor(accs), tensor(durations)
 
-    print('Val Loss: {:.4f}, Test Accuracy: {:.3f} ± {:.3f}, Duration: {:.3f}'.
+    print('Val Loss: {:.4f}, Test Accuracy: {:.4f} ± {:.4f}, Duration: {:.3f}'.
           format(loss.mean().item(),
                  acc.mean().item(),
                  acc.std().item(),
